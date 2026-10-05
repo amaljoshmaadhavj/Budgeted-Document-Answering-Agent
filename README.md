@@ -28,9 +28,10 @@ User Question
     │
     ▼
 [LLM Call 1 / 2] Question Analyzer & Search Planner (agent/planner.py)
-    │ (Produces structured JSON: question_type, concepts, search_terms, requirements, anchor_entities)
+    │ (Produces structured JSON: question_type, concepts, search_terms, requirements, anchor_entities, anchor_variants)
+    │ 5-Level Term Prioritization: Exact Phrases ➔ Natural Variants ➔ Conceptual Variants ➔ Focused Keywords ➔ Demoted Acronyms
     ▼
-Deterministic Harness (core/) — ZERO LLM calls
+Deterministic Harness (core/ & agent/) — ZERO LLM calls
     ├── Budget Manager (core/budget.py) ── Enforces max 6 document-tool calls
     ├── Tool Gateway (tools/gateway.py) ── Rejects 7th call; logs trace
     ├── Allowed Document Tools (tools/document_tools.py)
@@ -38,6 +39,10 @@ Deterministic Harness (core/) — ZERO LLM calls
     │     ├── 2. list_headings(doc_id)
     │     ├── 3. search_keyword(doc_id, keyword)
     │     └── 4. get_page(doc_id, page_number)
+    ├── Candidate Page Ranker (agent/controller.py) ── Multi-signal deterministic page scoring
+    │     ├── Term Tier weighting & specificity discount
+    │     ├── Multi-term co-occurrence & multi-anchor coverage bonus
+    │     └── Heading alignment & cluster proximity
     ├── Evidence Grounding Validator (core/evidence.py)
     │     ├── Apparatus / Bibliography filtering
     │     ├── Passing-mention disqualification
@@ -63,7 +68,8 @@ User Answer + Full Execution Trace
 - **LLM Calls:** Exactly 2 LLM calls per question:
   1. Planner LLM call (1 call)
   2. Final Answer LLM call (1 call)
-- **Retrieval & Evidence Validation:** Exactly 0 LLM calls (100% deterministic Python harness).
+- **Retrieval Scheduling & Page Ranking:** Exactly 0 LLM calls (100% deterministic Python harness).
+- **Evidence Validation & Grounding:** Exactly 0 LLM calls (100% deterministic Python harness).
 
 ---
 
@@ -158,24 +164,31 @@ When different pages contain contradictory statements:
 
 ---
 
-## 10. LLM Configuration (Google Gemini)
+## 10. LLM Configuration & Multi-Key Rotation (Google Gemini)
 
-The application uses Google Gemini through the unified [`LLMProvider`](llm/provider.py) abstraction:
+The application uses Google Gemini through the unified [`LLMProvider`](llm/provider.py) abstraction with enterprise multi-key rotation:
 
 ### Configuration (`.env`)
 ```bash
-# LLM Provider Configuration
-GEMINI_API_KEY=your_gemini_api_key_here
-
 # Model configuration
 LLM_MODEL=gemini-3.8-flash
+
+# Multi-Key Rotation (Primary and Failover Keys)
+GEMINI_API_KEY_1=your_first_gemini_api_key
+GEMINI_API_KEY_2=your_second_gemini_api_key
+GEMINI_API_KEY_3=your_third_gemini_api_key
+GEMINI_API_KEY_4=your_fourth_gemini_api_key
+
+# Backward-compatible single key (used if individual keys are omitted)
+# GEMINI_API_KEY=your_gemini_api_key
 ```
 
-### Security & Secret Handling
-- **Zero Secret Exposure:** The API key is read strictly from `.env` and is never logged, printed, echoed, returned in UI, or committed to Git (`.env` is excluded in `.gitignore`).
-- **Fail-Fast Error Handling:** When a valid `GEMINI_API_KEY` is present, the provider calls Gemini directly. If the API fails, it raises an explicit, safe `RuntimeError` rather than silently degrading to mock responses.
-- **Sanitized Exceptions:** `_sanitize_secret()` automatically strips any API key or authorization token pattern before formatting error messages.
-- **Deterministic Testing Mode:** Tests automatically run with stubbed/mock providers via `tests/conftest.py`, ensuring tests never spend API quota, require internet, or expose secrets.
+### Multi-Key Rotation & Secret Safety
+- **Automatic Quota / 429 Failover:** Seamlessly rotates through configured keys upon encountering rate limits (HTTP 429), quota exhaustion (`RESOURCE_EXHAUSTED`), or transient capacity errors without failing user queries.
+- **Fail-Fast on Genuine Errors:** Non-quota errors (e.g., malformed payloads, invalid schema) fail fast safely rather than masking issues or rotating pointlessly.
+- **Zero Secret Exposure:** Keys are read strictly from environment variables or local `.env` and are never logged, printed, echoed, returned in UI, or committed to Git (`.env` is excluded in `.gitignore`).
+- **Sanitized Exceptions:** `_sanitize_secret()` automatically strips any API key or token pattern before formatting error logs or UI notifications.
+- **Deterministic Testing Mode:** Tests run completely offline with stubbed/mock providers via `tests/conftest.py`, ensuring tests never spend API quota, require internet, or expose secrets.
 
 ---
 
@@ -205,7 +218,7 @@ LLM_MODEL=gemini-3.8-flash
 4. Configure your `.env` file:
    ```bash
    cp .env.example .env
-   # Add your GEMINI_API_KEY
+   # Add your Gemini API keys
    ```
 5. Launch the Streamlit application:
    ```bash
@@ -216,25 +229,36 @@ LLM_MODEL=gemini-3.8-flash
 
 ## 12. How to Run Tests
 
-Run the complete 43-test suite:
+Run the complete 74-test verification suite:
 ```bash
 python -m pytest -v
 ```
 
-### Verified Test Suite (43 Tests):
+### Verified Test Suite (74 Tests Passing):
+- **`tests/test_agent.py` (4 tests):** Factual question answering, state reset isolation, insufficient information handling, and supersession detection.
 - **`tests/test_budget.py` (5 tests):** Budget consumption, 7th call rejection, budget reset, gateway budget bypass prevention.
 - **`tests/test_tools.py` (5 tests):** Tool contracts, metadata only for `list_documents`, page numbers only for `search_keyword`, single-page retrieval for `get_page`, cache evasion prevention.
 - **`tests/test_evidence.py` (5 tests):** Evidence ledger item addition, requirement coverage tracking, claim statuses & contradiction recording, supersession resolution, answerability gate decisions.
 - **`tests/test_grounding.py` (15 tests):**
-  - Distractor rejection and positive matching for `A*`.
-  - Short technical identifier preservation (`BFS`, `DFS`, `AI`, `SQL`).
-  - Arbitrary synthetic entity grounding (`ZXQ-91`, `NovaCore`).
+  - Distractor rejection and positive matching for target pages.
+  - Short technical identifier preservation.
+  - Arbitrary synthetic entity grounding.
   - Multi-entity comparative grounding.
   - Generic filler word distractor prevention.
-  - Multi-word natural language phrases (`artificial intelligence`).
-  - **Passing-mention & bibliography regression tests** (`KryoVex-9`, `HelixMesh-7`, `ChronosGate-3`, `VeloSync-88`, `AeroQuant-12`).
+  - Multi-word natural language phrases.
+  - **Passing-mention & bibliography regression tests.**
 - **`tests/test_injection.py` (4 tests):** Injection pattern detection, untrusted XML evidence wrapping, system prompt security instructions, adversarial document handling.
-- **`tests/test_provider.py` (5 tests):** Gemini client detection, placeholder detection, fail-fast exception handling without silent mock fallback, secret sanitization, planner JSON schema enforcement.
+- **`tests/test_provider.py` (17 tests):** Gemini client detection, placeholder detection, multi-key rotation through 4 keys, quota/429 recovery, non-quota fail-fast behavior, secret sanitization, planner JSON schema enforcement.
+- **`tests/test_planner_prioritization.py` (12 tests):**
+  - Strict 5-tier search term prioritization.
+  - Concept phrase prioritization and abbreviation demotion.
+  - Framing word and long fragment suppression.
+  - Single-entity acronym preservation.
+  - Candidate page deterministic ranking (`CandidatePageRanker`).
+  - Redundant search-term suppression.
+  - Six-call budget preservation under heavy candidate generation.
+  - Supported definition regression and unavailable information handling.
+- **`tests/test_correctness_regression.py` (7 tests):** Morphological paraphrase grounding, bibliography-only rejection, passing-mention alone rejection, explanatory page support, multi-entity comparison, non-conflict temporal phrasing, and genuine synthetic supersession.
 
 ---
 

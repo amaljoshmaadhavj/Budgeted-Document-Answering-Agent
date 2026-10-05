@@ -8,20 +8,30 @@ from typing import Dict, Any, List, Optional
 import os
 import json
 import re
+import logging
 from dotenv import load_dotenv
 
 # Ensure environment variables from .env are loaded
 load_dotenv()
+
+logger = logging.getLogger(__name__)
 
 
 class LLMProvider:
     """Unified LLM interface for the planner analysis and final answer generation."""
 
     def __init__(self, model_name: Optional[str] = None, mock: Optional[bool] = None):
-        self.gemini_key = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
-        self.model_name = model_name or os.getenv("LLM_MODEL", "gemini-3.8-flash")
-        self.openai_key = os.getenv("OPENAI_API_KEY")
-        self.openai_base_url = os.getenv("OPENAI_BASE_URL")
+        self._gemini_keys: List[str] = self._load_gemini_keys()
+        self._current_key_index: int = 0
+        self.gemini_key: Optional[str] = self._gemini_keys[0] if self._gemini_keys else None
+        self.model_name: str = (
+            model_name
+            or os.getenv("GEMINI_FLASH_MODEL")
+            or os.getenv("LLM_MODEL")
+            or "gemini-3.1-flash-lite-preview"
+        )
+        self.openai_key: Optional[str] = os.getenv("OPENAI_API_KEY")
+        self.openai_base_url: Optional[str] = os.getenv("OPENAI_BASE_URL")
 
         if mock is not None:
             self._force_mock = mock
@@ -30,10 +40,29 @@ class LLMProvider:
 
         self._client_type = self._detect_client_type()
 
+    def _load_gemini_keys(self) -> List[str]:
+        """Loads all configured Gemini API keys in priority order.
+        
+        Reads GEMINI_API_KEY1 through GEMINI_API_KEY4, ignoring empty or placeholder values.
+        Falls back cleanly to legacy GEMINI_API_KEY or GOOGLE_API_KEY if no numbered keys are configured.
+        """
+        keys: List[str] = []
+        for var_name in ["GEMINI_API_KEY1", "GEMINI_API_KEY2", "GEMINI_API_KEY3", "GEMINI_API_KEY4"]:
+            val = os.getenv(var_name)
+            if val and val.strip() and not val.strip().startswith("your_"):
+                keys.append(val.strip())
+
+        if not keys:
+            legacy = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
+            if legacy and legacy.strip() and not legacy.strip().startswith("your_"):
+                keys.append(legacy.strip())
+
+        return keys
+
     def _detect_client_type(self) -> str:
         if self._force_mock:
             return "mock"
-        if self.gemini_key and not self.gemini_key.strip().startswith("your_"):
+        if self._gemini_keys:
             return "gemini"
         if self.openai_key and not self.openai_key.strip().startswith("your_"):
             return "openai"
@@ -66,6 +95,74 @@ class LLMProvider:
             raw_text = self._mock_completion(system_prompt, user_prompt)
         return self._parse_json(raw_text)
 
+    def _is_quota_error(self, exc: Exception) -> bool:
+        """Identifies whether an exception is specifically caused by quota exhaustion or rate limits.
+        
+        Inspects structured status codes and SDK exception types first, avoiding rotation on
+        auth (401/403), client errors (400), internal server errors (500), or programming bugs.
+        """
+        code = getattr(exc, "code", None)
+        status_code = getattr(exc, "status_code", None)
+        http_status = getattr(exc, "http_status", None)
+
+        if callable(code):
+            try:
+                code = code()
+            except Exception:
+                code = None
+
+        status_values = [c for c in (code, status_code, http_status) if c is not None]
+        for s in status_values:
+            if s == 429 or str(s) == "429":
+                return True
+            if isinstance(s, int) and s in (400, 401, 403, 404, 500, 502, 503, 504):
+                return False
+
+        cls_name = exc.__class__.__name__
+        if cls_name in ("ResourceExhausted", "TooManyRequests"):
+            return True
+        if cls_name in ("InvalidArgument", "Unauthenticated", "PermissionDenied", "NotFound", "InternalServerError"):
+            return False
+
+        grpc_status = getattr(exc, "grpc_status_code", None)
+        if grpc_status is not None:
+            grpc_str = str(grpc_status)
+            if "RESOURCE_EXHAUSTED" in grpc_str:
+                return True
+            if any(non_quota in grpc_str for non_quota in ("INVALID_ARGUMENT", "UNAUTHENTICATED", "PERMISSION_DENIED")):
+                return False
+
+        msg = str(exc).lower()
+
+        exclusion_patterns = [
+            "api_key_invalid", "invalid_api_key", "api key not valid",
+            "permission_denied", "unauthenticated", "forbidden", "401", "403",
+            "invalid_argument", "bad request", "jsondecodeerror", "validation error",
+            "malformed"
+        ]
+        if any(pat in msg for pat in exclusion_patterns):
+            return False
+
+        quota_indicators = [
+            "429",
+            "resource_exhausted",
+            "resourceexhausted",
+            "quota exceeded",
+            "quota_exceeded",
+            "rate limit",
+            "ratelimit",
+            "too many requests",
+            "exceeded your current quota",
+            "queries per minute",
+            "queries per day",
+            "requests per minute",
+            "requests per day"
+        ]
+        if any(q in msg for q in quota_indicators):
+            return True
+
+        return False
+
     def _call_gemini(
         self,
         system_prompt: str,
@@ -73,30 +170,60 @@ class LLMProvider:
         temperature: float = 0.0,
         response_mime_type: Optional[str] = None
     ) -> str:
-        """Calls the Gemini API directly. Never silently falls back to mock on failure."""
-        if not self.gemini_key or self.gemini_key.strip().startswith("your_"):
+        """Calls the Gemini API with multi-key quota rotation.
+        
+        Never silently falls back to mock on failure.
+        """
+        if not self._gemini_keys:
             raise ValueError("GEMINI_API_KEY is not configured or contains placeholder value.")
 
-        try:
-            import google.generativeai as genai
-            genai.configure(api_key=self.gemini_key)
-            model = genai.GenerativeModel(
-                model_name=self.model_name,
-                system_instruction=system_prompt if system_prompt else None
-            )
+        total_keys = len(self._gemini_keys)
+        start_idx = self._current_key_index
+        last_error: Optional[Exception] = None
 
-            gen_config = {"temperature": temperature}
-            if response_mime_type:
-                gen_config["response_mime_type"] = response_mime_type
+        for attempt in range(total_keys):
+            key_idx = (start_idx + attempt) % total_keys
+            api_key = self._gemini_keys[key_idx]
 
-            response = model.generate_content(
-                user_prompt,
-                generation_config=gen_config
-            )
-            return response.text or ""
-        except Exception as e:
-            safe_err = self._sanitize_secret(str(e))
-            raise RuntimeError(f"Gemini API invocation failed: {safe_err}") from None
+            logger.info("Gemini request attempt: key_index=%d", key_idx + 1)
+
+            try:
+                import google.generativeai as genai
+                genai.configure(api_key=api_key)
+                model = genai.GenerativeModel(
+                    model_name=self.model_name,
+                    system_instruction=system_prompt if system_prompt else None
+                )
+
+                gen_config = {"temperature": temperature}
+                if response_mime_type:
+                    gen_config["response_mime_type"] = response_mime_type
+
+                response = model.generate_content(
+                    user_prompt,
+                    generation_config=gen_config
+                )
+
+                # Update active key index to the successfully responding key
+                self._current_key_index = key_idx
+                self.gemini_key = api_key
+                return response.text or ""
+
+            except Exception as e:
+                last_error = e
+                if self._is_quota_error(e) and attempt < total_keys - 1:
+                    next_idx = (key_idx + 1) % total_keys
+                    logger.warning(
+                        "Gemini quota error: rotating to key_index=%d",
+                        next_idx + 1
+                    )
+                    continue
+                else:
+                    safe_err = self._sanitize_secret(str(e))
+                    raise RuntimeError(f"Gemini API invocation failed: {safe_err}") from None
+
+        safe_err = self._sanitize_secret(str(last_error)) if last_error else "Quota exhausted across all configured keys."
+        raise RuntimeError(f"Gemini API invocation failed: All configured Gemini keys exhausted due to quota/rate limits: {safe_err}")
 
     def _call_openai(self, system_prompt: str, user_prompt: str, temperature: float) -> str:
         from openai import OpenAI
@@ -119,6 +246,9 @@ class LLMProvider:
         if not text:
             return text
         sanitized = text
+        for key in self._gemini_keys:
+            if key and len(key) > 5:
+                sanitized = sanitized.replace(key, "[REDACTED_API_KEY]")
         if self.gemini_key and len(self.gemini_key) > 5:
             sanitized = sanitized.replace(self.gemini_key, "[REDACTED_API_KEY]")
         if self.openai_key and len(self.openai_key) > 5:
@@ -254,7 +384,8 @@ class LLMProvider:
             "concepts": anchor_entities[:4],
             "search_terms": search_terms[:5],
             "requirements": requirements,
-            "anchor_entities": anchor_entities[:3]
+            "anchor_entities": anchor_entities[:3],
+            "anchor_variants": {}
         }
 
     def _parse_json(self, raw_text: str) -> Dict[str, Any]:
@@ -290,5 +421,7 @@ class LLMProvider:
             parsed["requirements"] = []
         if "anchor_entities" not in parsed or not isinstance(parsed["anchor_entities"], list):
             parsed["anchor_entities"] = []
+        if "anchor_variants" not in parsed or not isinstance(parsed["anchor_variants"], dict):
+            parsed["anchor_variants"] = {}
 
         return parsed

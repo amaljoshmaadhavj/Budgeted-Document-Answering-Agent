@@ -40,11 +40,11 @@ class EvidenceGroundingValidator:
         # Copular / Definitional / Value assignment
         # "is an algorithm", "was $5 million", "is 12V", "is optimal", "is complete", "was updated to"
         r"\b(?:is|are|was|were)\s+(?:an?|the|[a-zA-Z-]+|[\$£€¥]?\d+)\b",
-        r"\b(?:is|are|was|were)\s+(?:defined|known|characterized|classified)\s+as\b",
-        r"\b(?:refers\s+to|denotes|represents|stands\s+for|means)\b",
+        r"\b(?:is|are|was|were)\s+(?:defined|known|characterized|classified|described|considered)\s+(?:as|to\s+be)\b",
+        r"\b(?:refers\s+to|denotes|represents|stands\s+for|means|signifies|entails|involves|constitutes|embodies|serves\s+as|acts\s+as)\b",
         r"\b(?:consists\s+of|composed\s+of|characterized\s+by)\b",
         # Functional / Operational / Behavioral predicates
-        r"\b(?:operates?|operat(?:ed|ing)|computes?|comput(?:ed|ing)|provides?|provid(?:ed|ing)|enables?|enabl(?:ed|ing)|uses?|us(?:ed|ing)|implements?|implement(?:ed|ing)|performs?|perform(?:ed|ing)|evaluates?|evaluat(?:ed|ing)|determines?|determin(?:ed|ing)|handles?|handl(?:ed|ing)|achieves?|achiev(?:ed|ing)|works?|work(?:ed|ing)|allows?|allow(?:ed|ing)|executes?|execut(?:ed|ing)|transforms?|transform(?:ed|ing)|produces?|produc(?:ed|ing)|requires?|requir(?:ed|ing)|optimizes?|optimiz(?:ed|ing)|coordinates?|coordinat(?:ed|ing)|processes|process(?:ed|ing)|manages?|manag(?:ed|ing)|generates?|generat(?:ed|ing)|stores?|stor(?:ed|ing)|transfers?|transferr(?:ed|ing)|traverses?|travers(?:ed|ing)|dispatches?|dispatch(?:ed|ing)|buffers?|buffer(?:ed|ing)|measures?|measur(?:ed|ing)|structures?|structur(?:ed|ing)|facilitates?|facilitat(?:ed|ing)|calculates?|calculat(?:ed|ing)|acts\s+rationally|solves?|solv(?:ed|ing)|encompasses?|maps?|mapp(?:ed|ing)|supersedes?|supersed(?:ed|ing))\b",
+        r"\b(?:operates?|operat(?:ed|ing)|computes?|comput(?:ed|ing)|provides?|provid(?:ed|ing)|enables?|enabl(?:ed|ing)|uses?|us(?:ed|ing)|implements?|implement(?:ed|ing)|performs?|perform(?:ed|ing)|evaluates?|evaluat(?:ed|ing)|determines?|determin(?:ed|ing)|handles?|handl(?:ed|ing)|achieves?|achiev(?:ed|ing)|works?|work(?:ed|ing)|allows?|allow(?:ed|ing)|executes?|execut(?:ed|ing)|transforms?|transform(?:ed|ing)|produces?|produc(?:ed|ing)|requires?|requir(?:ed|ing)|optimizes?|optimiz(?:ed|ing)|coordinates?|coordinat(?:ed|ing)|processes|process(?:ed|ing)|manages?|manag(?:ed|ing)|generates?|generat(?:ed|ing)|stores?|stor(?:ed|ing)|transfers?|transferr(?:ed|ing)|traverses?|travers(?:ed|ing)|dispatches?|dispatch(?:ed|ing)|buffers?|buffer(?:ed|ing)|measures?|measur(?:ed|ing)|structures?|structur(?:ed|ing)|facilitates?|facilitat(?:ed|ing)|calculates?|calculat(?:ed|ing)|acts?|act(?:ed|ing)|solves?|solv(?:ed|ing)|encompasses?|maps?|mapp(?:ed|ing)|supersedes?|supersed(?:ed|ing))\b",
         # Teleological / Design / Intent
         r"\b(?:designed\s+(?:to|for)|intended\s+to|built\s+to|developed\s+to|created\s+to|used\s+(?:to|for)|serves\s+to|aims\s+to)\b",
         # Historical / Adoption
@@ -192,6 +192,69 @@ class EvidenceGroundingValidator:
             "explanatory_contexts": explanatory_contexts,
             "passing_contexts": passing_contexts
         }
+
+    @classmethod
+    def evaluate_anchor_with_variants(
+        cls,
+        text: str,
+        anchor: str,
+        variants: Optional[List[str]] = None
+    ) -> Dict[str, Any]:
+        """Evaluates whether an anchor or any of its dynamic variants/aliases establishes
+        explanatory evidence or mere occurrence (passing mention / citation).
+        
+        Prioritizes primary anchor evaluation, then checks each dynamic variant.
+        Grounding is established if any variant achieves genuine explanatory grounding.
+        """
+        a_clean = anchor.strip()
+        candidate_forms = [a_clean]
+        if variants:
+            for v in variants:
+                v_clean = str(v).strip()
+                if v_clean and v_clean.lower() not in [x.lower() for x in candidate_forms]:
+                    candidate_forms.append(v_clean)
+
+        explanatory_matches: List[str] = []
+        passing_matches: List[str] = []
+        all_explanatory_contexts: List[str] = []
+        all_passing_contexts: List[str] = []
+
+        for cand in candidate_forms:
+            res = cls.evaluate_anchor_occurrence(text, cand)
+            if res["is_explanatory"]:
+                explanatory_matches.append(cand)
+                all_explanatory_contexts.extend(res["explanatory_contexts"])
+            elif res["has_occurrence"]:
+                passing_matches.append(cand)
+                all_passing_contexts.extend(res["passing_contexts"])
+
+        if explanatory_matches:
+            return {
+                "has_occurrence": True,
+                "is_explanatory": True,
+                "is_passing": False,
+                "matched_form": explanatory_matches[0],
+                "explanatory_contexts": all_explanatory_contexts,
+                "passing_contexts": all_passing_contexts
+            }
+        elif passing_matches:
+            return {
+                "has_occurrence": True,
+                "is_explanatory": False,
+                "is_passing": True,
+                "matched_form": passing_matches[0],
+                "explanatory_contexts": [],
+                "passing_contexts": all_passing_contexts
+            }
+        else:
+            return {
+                "has_occurrence": False,
+                "is_explanatory": False,
+                "is_passing": False,
+                "matched_form": None,
+                "explanatory_contexts": [],
+                "passing_contexts": []
+            }
 
     @classmethod
     def has_explanatory_requirement_evidence(cls, text: str, substantive_words: List[str]) -> bool:

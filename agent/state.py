@@ -18,6 +18,7 @@ class QuestionState:
     search_terms: List[str] = field(default_factory=list)
     evidence_requirements: List[str] = field(default_factory=list)
     anchor_entities: List[str] = field(default_factory=list)
+    anchor_variants: Dict[str, List[str]] = field(default_factory=dict)
     candidate_pages: List[int] = field(default_factory=list)
     fetched_pages: List[int] = field(default_factory=list)
     evidence: List[Dict[str, Any]] = field(default_factory=list)

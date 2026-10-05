@@ -10,7 +10,17 @@ Your objective is to analyze the user's question before retrieval and produce a 
 
 CRITICAL CONSTRAINTS:
 1. Retrieval is limited to exact keyword search and heading inspection over a PDF.
-2. Search terms must be clean, specific keywords or short key phrases (1-3 words) directly relevant to the question.
+2. Search terms must be clean, specific keywords or meaningful concept phrases (1-3 words) directly relevant to the question.
+   - For concept, comparison, and definition questions: Generate meaningful conceptual and technical variants that could plausibly appear in the document even when the user's wording differs (e.g. underlying technical mechanisms, formalisms, evaluation criteria, or specialized terminology).
+   - NEVER extract generic question-function words (e.g. "what", "does", "mean", "meaning", "explain", "explanation", "defined", "definition", "describe", "discuss", "overview", "information", "regarding", "term", "adopted", "coined", "called", "named", "phrase", "word", "concept", "differ", "difference", "between", "versus", "vs") as search terms.
+   - NEVER generate long awkward combinations or sentence fragments (e.g. "term <Concept> adopted" or "how does X differ from Y" are forbidden; extract only the core concept phrases).
+   - AVOID redundant variants, synonymous duplicates, or generic words that consume tool budget.
+   - STRICT 5-LEVEL SEARCH TERM PRIORITIZATION:
+     1. exact meaningful concept phrase from the question
+     2. natural terminology variants (morphological / grammatical equivalents)
+     3. conceptual/technical variants (underlying mechanisms, formal notations, specialized variants)
+     4. focused component keywords (substantive words from the concept)
+     5. broad abbreviations or short acronyms (MUST be placed LAST)
 3. Categorize the question into exactly one of these types:
    - direct_fact
    - definition
@@ -30,14 +40,17 @@ Output MUST be a valid JSON object with the following schema:
     "requirement 1",
     "requirement 2"
   ],
-  "anchor_entities": ["primary_entity_1"]
+  "anchor_entities": ["primary_entity_1"],
+  "anchor_variants": {{
+    "primary_entity_1": ["variant_1", "variant_2"]
+  }}
 }}
 
-ANCHOR ENTITIES INSTRUCTION:
-- anchor_entities must identify the primary subject(s) or distinct named entities that the question is fundamentally about (e.g. specific named systems, protocols, algorithms, methods, or proper nouns).
-- anchor_entities MUST be dynamically derived from the current question text.
-- Short technical identifiers, acronyms, and symbols must be preserved as anchors.
-- Common grammatical filler words must never become anchors.
+ANCHOR ENTITIES & VARIANTS INSTRUCTION:
+- anchor_entities must identify the primary subject(s) or distinct named entities/concepts that the question is fundamentally about (e.g. specific named systems, protocols, algorithms, methods, or cohesive concept phrases).
+- anchor_entities MUST be cohesive concept phrases where applicable (e.g. multi-word nouns or verb-adverb concepts), NOT broken into isolated common words or function words.
+- anchor_variants: Provide a mapping of each anchor entity to dynamic variants, morphological forms, synonyms, or conceptual paraphrases (e.g. nominal/adjectival equivalents, verb forms, and conceptual synonyms).
+- Common grammatical filler words and question-function words must never become anchors.
 
 {SecurityBoundary.get_security_instruction()}
 """

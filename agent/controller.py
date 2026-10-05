@@ -1,6 +1,6 @@
 """Agent Controller orchestrating question analysis, deterministic harness, action selection, and final answering."""
 
-from typing import Dict, Any, List, Optional, Tuple
+from typing import Dict, Any, List, Optional, Tuple, Set
 import re
 
 from agent.state import QuestionState
@@ -13,6 +13,109 @@ from core.security import SecurityBoundary
 from logging_utils.trace import TraceLogger
 from tools.gateway import ToolGateway
 from llm.provider import LLMProvider
+
+
+class CandidatePageRanker:
+    """Deterministically ranks candidate pages using planner search signals, co-occurrence, and proximity."""
+
+    @classmethod
+    def rank_pages(
+        cls,
+        page_matches: Dict[int, List[Dict[str, Any]]],
+        anchor_entities: List[str],
+        anchor_variants: Dict[str, List[str]],
+        search_terms: List[str],
+        heading_matches: Dict[int, List[Dict[str, Any]]],
+        fetched_pages: List[int]
+    ) -> List[Tuple[int, float]]:
+        """Calculates deterministic multi-factor relevance scores for candidate pages.
+        
+        Returns:
+            List of (page_num, score) tuples sorted in descending order of score.
+        """
+        scores: Dict[int, float] = {}
+
+        anchor_words_map: Dict[str, Set[str]] = {
+            a.lower(): set(w.lower() for w in a.split()) for a in anchor_entities
+        }
+
+        all_pages = set(page_matches.keys()).union(heading_matches.keys())
+
+        for p in all_pages:
+            if p in fetched_pages:
+                continue
+
+            score = 0.0
+            matches = page_matches.get(p, [])
+            headings = heading_matches.get(p, [])
+
+            distinct_terms = set()
+            anchors_hit = set()
+
+            for m in matches:
+                term = m["term"]
+                term_lower = term.lower()
+                distinct_terms.add(term_lower)
+                total_matches = m.get("total_matches", 1)
+
+                # Base weight by search term tier/priority
+                term_idx = search_terms.index(term) if term in search_terms else 99
+                if term_idx == 0:
+                    base_weight = 12.0
+                elif term_idx == 1:
+                    base_weight = 10.0
+                elif term_idx == 2:
+                    base_weight = 8.0
+                elif term_idx == 3:
+                    base_weight = 6.0
+                else:
+                    base_weight = 4.0
+
+                # Specificity discount: heavily discount broad terms matching >20 pages (e.g. 'AI' matching 156 pages)
+                if total_matches > 20:
+                    specificity = 0.25
+                elif total_matches > 10:
+                    specificity = 0.6
+                elif total_matches <= 3:
+                    specificity = 1.4
+                else:
+                    specificity = 1.0
+
+                # Check if term aligns with any anchor entity
+                for a_lower, a_words in anchor_words_map.items():
+                    if a_lower in term_lower or term_lower in a_lower or any(w in term_lower for w in a_words if len(w) >= 3):
+                        anchors_hit.add(a_lower)
+
+                score += base_weight * specificity
+
+            # Multi-term Co-occurrence Bonus: pages matching multiple distinct search terms are high-value intersections
+            k = len(distinct_terms)
+            if k >= 2:
+                score += 8.0 * (k - 1)
+
+            # Multi-anchor Coverage Bonus: pages bridging multiple distinct anchors (critical for comparison questions)
+            if len(anchors_hit) >= 2:
+                score += 20.0
+
+            # Heading alignment
+            for h in headings:
+                is_apparatus = h.get("is_apparatus", False)
+                if is_apparatus:
+                    score -= 10.0
+                else:
+                    score += 8.0
+
+            scores[p] = score
+
+        # Proximity to High-Scoring Clusters (adjacent pages in technical explanations)
+        high_value_pages = [p for p, sc in scores.items() if sc >= 15.0]
+        for p in scores:
+            if p not in high_value_pages:
+                if any(abs(p - hv) == 1 for hv in high_value_pages):
+                    scores[p] += 3.0
+
+        sorted_candidates = sorted(scores.items(), key=lambda x: (x[1], -x[0]), reverse=True)
+        return sorted_candidates
 
 
 class AgentController:
@@ -43,36 +146,72 @@ class AgentController:
         state.search_terms = plan.get("search_terms", [])
         state.evidence_requirements = plan.get("requirements", [])
         state.anchor_entities = plan.get("anchor_entities", [])
+        state.anchor_variants = plan.get("anchor_variants", {})
         ledger.set_requirements(state.evidence_requirements)
         trace_logger.set_planner_output(plan)
 
         # 3. Action Selection Loop (Deterministic Harness)
         headings_checked = False
         searched_keywords = set()
-        candidate_page_scores: Dict[int, int] = {}  # page -> match count
+        page_matches: Dict[int, List[Dict[str, Any]]] = {}
+        heading_matches: Dict[int, List[Dict[str, Any]]] = {}
 
         # Main retrieval loop: strictly governed by remaining budget
         while budget.can_call():
-            # Step A: If we have unsearched search terms, search them
             unsearched_terms = [t for t in state.search_terms if t.lower() not in searched_keywords]
-            if unsearched_terms:
+            ranked_candidates = CandidatePageRanker.rank_pages(
+                page_matches=page_matches,
+                anchor_entities=state.anchor_entities,
+                anchor_variants=state.anchor_variants,
+                search_terms=state.search_terms,
+                heading_matches=heading_matches,
+                fetched_pages=state.fetched_pages
+            )
+
+            # Determine whether to execute a keyword search or fetch the top candidate page
+            should_search = False
+            if not ranked_candidates:
+                should_search = bool(unsearched_terms)
+            elif unsearched_terms:
+                anchors_searched = {
+                    a.lower() for a in state.anchor_entities
+                    if any(a.lower() in sk or sk in a.lower() for sk in searched_keywords)
+                }
+                has_unsearched_anchors = (
+                    len(state.anchor_entities) >= 2
+                    and len(anchors_searched) < len(state.anchor_entities)
+                )
+                can_afford_search = budget.remaining_calls > max(len(state.anchor_entities), 2)
+
+                if has_unsearched_anchors and can_afford_search:
+                    should_search = True
+                elif not has_unsearched_anchors:
+                    top_score = ranked_candidates[0][1] if ranked_candidates else 0
+                    if top_score < 8.0 and can_afford_search and len(searched_keywords) < 2:
+                        should_search = True
+                    else:
+                        should_search = False
+
+            if should_search and unsearched_terms:
                 term_to_search = unsearched_terms[0]
                 searched_keywords.add(term_to_search.lower())
                 try:
                     result = gateway.execute("search_keyword", doc_id=doc_id, keyword=term_to_search)
                     matching_pages = result.get("pages", [])
+                    total_m = len(matching_pages)
                     for p in matching_pages:
-                        candidate_page_scores[p] = candidate_page_scores.get(p, 0) + 2
-                    # If this term matched pages, prioritize fetching over searching further terms immediately
-                    # if we have enough candidate pages for requirements
-                    if len(candidate_page_scores) >= len(state.evidence_requirements) and len(candidate_page_scores) > 0:
-                        pass  # We can proceed to fetching or continue searching
+                        if p not in page_matches:
+                            page_matches[p] = []
+                        page_matches[p].append({
+                            "term": term_to_search,
+                            "total_matches": total_m
+                        })
                 except BudgetExceededError:
                     break
                 continue
 
-            # Step B: If no candidate pages found yet and headings haven't been checked, inspect TOC
-            if not candidate_page_scores and not headings_checked:
+            # If no candidate pages and search terms exhausted, inspect TOC
+            if not ranked_candidates and not headings_checked:
                 headings_checked = True
                 try:
                     result = gateway.execute("list_headings", doc_id=doc_id)
@@ -83,27 +222,26 @@ class AgentController:
                         is_apparatus = any(re.search(p, htitle) for p in EvidenceGroundingValidator.APPARATUS_HEADINGS)
                         for term in state.search_terms + state.concepts:
                             if term.lower() in htitle:
-                                score_delta = 1 if is_apparatus else 3
-                                candidate_page_scores[hpage] = candidate_page_scores.get(hpage, 0) + score_delta
+                                if hpage not in heading_matches:
+                                    heading_matches[hpage] = []
+                                heading_matches[hpage].append({
+                                    "title": htitle,
+                                    "term": term,
+                                    "is_apparatus": is_apparatus
+                                })
                 except BudgetExceededError:
                     break
                 continue
 
-            # Step C: Fetch candidate pages
-            unfetched_candidates = [
-                p for p, _ in sorted(candidate_page_scores.items(), key=lambda x: x[1], reverse=True)
-                if p not in state.fetched_pages
-            ]
-
-            if unfetched_candidates:
-                target_page = unfetched_candidates[0]
+            # Fetch top candidate page
+            if ranked_candidates:
+                target_page = ranked_candidates[0][0]
                 try:
                     page_result = gateway.execute("get_page", doc_id=doc_id, page_number=target_page)
                     state.fetched_pages.append(target_page)
                     page_text = page_result.get("text", "")
 
                     if page_text:
-                        # Extract evidence and verify requirement satisfaction
                         self._process_page_evidence(
                             page_num=target_page,
                             text=page_text,
@@ -123,7 +261,7 @@ class AgentController:
                     break
                 continue
 
-            # Step D: If candidate pages exhausted and still have budget, check headings if not already
+            # If candidate pages exhausted and still have budget, check headings if not already
             if not headings_checked:
                 headings_checked = True
                 try:
@@ -132,9 +270,16 @@ class AgentController:
                     for h in headings:
                         htitle = h.get("title", "").lower()
                         hpage = h.get("page", 1)
+                        is_apparatus = any(re.search(p, htitle) for p in EvidenceGroundingValidator.APPARATUS_HEADINGS)
                         for term in state.search_terms + state.concepts:
                             if term.lower() in htitle and hpage not in state.fetched_pages:
-                                candidate_page_scores[hpage] = candidate_page_scores.get(hpage, 0) + 1
+                                if hpage not in heading_matches:
+                                    heading_matches[hpage] = []
+                                heading_matches[hpage].append({
+                                    "title": htitle,
+                                    "term": term,
+                                    "is_apparatus": is_apparatus
+                                })
                     continue
                 except BudgetExceededError:
                     break
@@ -150,7 +295,7 @@ class AgentController:
                 state.stop_reason = "Evidence collection completed."
 
         # 4. Update state tracking
-        state.candidate_pages = sorted(list(candidate_page_scores.keys()))
+        state.candidate_pages = sorted(list(set(page_matches.keys()).union(heading_matches.keys())))
         state.budget_used = budget.calls_used
         state.budget_remaining = budget.remaining_calls
 
@@ -192,17 +337,21 @@ class AgentController:
             # Audit logged, but content will be cleanly wrapped in security tags
             pass
 
-        # Evaluate Anchor Grounding: Explanatory vs Passing/Apparatus
+        # Evaluate Anchor Grounding: Explanatory vs Passing/Apparatus (including dynamic variants)
         matched_anchors_on_page: List[str] = []
         passing_anchors_on_page: List[str] = []
+        matched_variants_on_page: List[str] = []
 
         for anchor in state.anchor_entities:
             a_clean = anchor.strip()
             if not a_clean:
                 continue
-            eval_res = EvidenceGroundingValidator.evaluate_anchor_occurrence(text, a_clean)
+            variants = state.anchor_variants.get(a_clean, [])
+            eval_res = EvidenceGroundingValidator.evaluate_anchor_with_variants(text, a_clean, variants)
             if eval_res["is_explanatory"]:
                 matched_anchors_on_page.append(a_clean)
+                if eval_res.get("matched_form"):
+                    matched_variants_on_page.append(eval_res["matched_form"])
             elif eval_res["has_occurrence"]:
                 passing_anchors_on_page.append(a_clean)
 
@@ -232,9 +381,17 @@ class AgentController:
                     )
 
                 if anchor_ok:
-                    if substantive_words:
+                    # Gather substantive words including matched anchor variants
+                    all_substantive = list(substantive_words)
+                    for mf in matched_variants_on_page + matched_anchors_on_page:
+                        for mfw in mf.split():
+                            clean_mfw = mfw.lower().strip("?,.:;\"'()")
+                            if clean_mfw not in generic_fillers and len(clean_mfw) >= 2 and clean_mfw not in all_substantive:
+                                all_substantive.append(clean_mfw)
+
+                    if all_substantive:
                         # Require that substantive requirement keywords appear in an explanatory context
-                        if EvidenceGroundingValidator.has_explanatory_requirement_evidence(text, substantive_words):
+                        if EvidenceGroundingValidator.has_explanatory_requirement_evidence(text, all_substantive):
                             supported_reqs.append(req)
                             ledger.mark_requirement_satisfied(req, page_num)
                     else:
@@ -253,45 +410,41 @@ class AgentController:
         )
 
         # Contradiction / Supersession checking against previously fetched pages
-        # Only evaluate pages that share a common anchor entity and contain revision language
+        # Only evaluate pages that share a common anchor entity, search terms, or concepts
         for prev_item in ledger.evidence_items:
             if prev_item.page == page_num:
                 continue
             shared_anchors = set([a.lower() for a in prev_item.matched_anchors]).intersection(
                 [a.lower() for a in matched_anchors_on_page]
             )
-            # Check if both pages share an anchor entity or key search terms/concepts
             shared_terms = set([t.lower() for t in state.search_terms + state.concepts if len(t) >= 3]).intersection(
                 [w.lower() for w in re.findall(r'\b\w+\b', prev_item.text)]
             ).intersection(
                 [w.lower() for w in re.findall(r'\b\w+\b', text)]
             )
             if shared_anchors or shared_terms or (not state.anchor_entities and prev_item.matched_anchors == matched_anchors_on_page):
-                combined = f"{prev_item.text} {text}".lower()
-                has_revision = any(re.search(term, combined) for term in AnswerabilityGate.SUPERSEDING_TERMS)
-                if has_revision:
-                    resolution, details = AnswerabilityGate.evaluate_supersession(
-                        text_a=prev_item.text,
-                        page_a=prev_item.page,
-                        text_b=text,
-                        page_b=page_num
+                resolution, details = AnswerabilityGate.evaluate_supersession(
+                    text_a=prev_item.text,
+                    page_a=prev_item.page,
+                    text_b=text,
+                    page_b=page_num
+                )
+                if resolution in ("SUPERSEDED", "CONFLICTING"):
+                    ledger.add_contradiction(
+                        claim_1=f"Excerpt on Page {prev_item.page}",
+                        page_1=prev_item.page,
+                        claim_2=f"Excerpt on Page {page_num}",
+                        page_2=page_num,
+                        resolution=resolution,
+                        details=details
                     )
-                    if resolution in ("SUPERSEDED", "CONFLICTING"):
-                        ledger.add_contradiction(
-                            claim_1=f"Excerpt on Page {prev_item.page}",
-                            page_1=prev_item.page,
-                            claim_2=f"Excerpt on Page {page_num}",
-                            page_2=page_num,
-                            resolution=resolution,
-                            details=details
+                    if resolution == "SUPERSEDED":
+                        ledger.add_claim(
+                            claim=f"Statement on Page {prev_item.page}",
+                            sources=[prev_item.page],
+                            status="SUPERSEDED",
+                            reason=details
                         )
-                        if resolution == "SUPERSEDED":
-                            ledger.add_claim(
-                                claim=f"Statement on Page {prev_item.page}",
-                                sources=[prev_item.page],
-                                status="SUPERSEDED",
-                                reason=details
-                            )
 
     def _generate_final_answer(
         self,

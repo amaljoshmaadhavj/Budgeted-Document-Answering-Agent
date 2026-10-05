@@ -18,6 +18,7 @@ from tools.document_tools import (
 class ToolGateway:
     """Deterministic gateway regulating access to document tools with strict budget tracking."""
 
+
     ALLOWED_TOOLS = {
         "list_documents": list_documents,
         "list_headings": list_headings,
