@@ -44,7 +44,7 @@ class EvidenceGroundingValidator:
         r"\b(?:refers\s+to|denotes|represents|stands\s+for|means|signifies|entails|involves|constitutes|embodies|serves\s+as|acts\s+as)\b",
         r"\b(?:consists\s+of|composed\s+of|characterized\s+by)\b",
         # Functional / Operational / Behavioral predicates
-        r"\b(?:operates?|operat(?:ed|ing)|computes?|comput(?:ed|ing)|provides?|provid(?:ed|ing)|enables?|enabl(?:ed|ing)|uses?|us(?:ed|ing)|implements?|implement(?:ed|ing)|performs?|perform(?:ed|ing)|evaluates?|evaluat(?:ed|ing)|determines?|determin(?:ed|ing)|handles?|handl(?:ed|ing)|achieves?|achiev(?:ed|ing)|works?|work(?:ed|ing)|allows?|allow(?:ed|ing)|executes?|execut(?:ed|ing)|transforms?|transform(?:ed|ing)|produces?|produc(?:ed|ing)|requires?|requir(?:ed|ing)|optimizes?|optimiz(?:ed|ing)|coordinates?|coordinat(?:ed|ing)|processes|process(?:ed|ing)|manages?|manag(?:ed|ing)|generates?|generat(?:ed|ing)|stores?|stor(?:ed|ing)|transfers?|transferr(?:ed|ing)|traverses?|travers(?:ed|ing)|dispatches?|dispatch(?:ed|ing)|buffers?|buffer(?:ed|ing)|measures?|measur(?:ed|ing)|structures?|structur(?:ed|ing)|facilitates?|facilitat(?:ed|ing)|calculates?|calculat(?:ed|ing)|acts?|act(?:ed|ing)|solves?|solv(?:ed|ing)|encompasses?|maps?|mapp(?:ed|ing)|supersedes?|supersed(?:ed|ing))\b",
+        r"\b(?:operates?|operat(?:ed|ing)|computes?|comput(?:ed|ing)|provides?|provid(?:ed|ing)|enables?|enabl(?:ed|ing)|uses?|us(?:ed|ing)|utiliz(?:es?|ed|ing)?|appl(?:ies|ied|ying)?|features?|featur(?:ed|ing)?|implements?|implement(?:ed|ing)|performs?|perform(?:ed|ing)|evaluates?|evaluat(?:ed|ing)|determines?|determin(?:ed|ing)|handles?|handl(?:ed|ing)|achieves?|achiev(?:ed|ing)|works?|work(?:ed|ing)|allows?|allow(?:ed|ing)|executes?|execut(?:ed|ing)|transforms?|transform(?:ed|ing)|produces?|produc(?:ed|ing)|requires?|requir(?:ed|ing)|optimizes?|optimiz(?:ed|ing)|coordinates?|coordinat(?:ed|ing)|processes|process(?:ed|ing)|manages?|manag(?:ed|ing)|generates?|generat(?:ed|ing)|stores?|stor(?:ed|ing)|transfers?|transferr(?:ed|ing)|traverses?|travers(?:ed|ing)|dispatches?|dispatch(?:ed|ing)|buffers?|buffer(?:ed|ing)|measures?|measur(?:ed|ing)|structures?|structur(?:ed|ing)|facilitates?|facilitat(?:ed|ing)|calculates?|calculat(?:ed|ing)|acts?|act(?:ed|ing)|solves?|solv(?:ed|ing)|encompasses?|maps?|mapp(?:ed|ing)|supersedes?|supersed(?:ed|ing))\b",
         # Teleological / Design / Intent
         r"\b(?:designed\s+(?:to|for)|intended\s+to|built\s+to|developed\s+to|created\s+to|used\s+(?:to|for)|serves\s+to|aims\s+to)\b",
         # Historical / Adoption
@@ -274,6 +274,183 @@ class EvidenceGroundingValidator:
                     return True
         return False
 
+    @classmethod
+    def validate_requirement_on_page(
+        cls,
+        text: str,
+        requirement: str,
+        facet: Optional[Dict[str, Any]] = None,
+        anchor: Optional[str] = None,
+        anchor_variants: Optional[List[str]] = None,
+        question_type: Optional[str] = None,
+        **kwargs
+    ) -> Tuple[bool, str]:
+        """Validates whether fetched page text actually satisfies a specific requirement.
+        
+        Enforces that subject relevance and is_explanatory == True are NEVER sufficient by themselves
+        to satisfy a requirement. Requirement satisfaction strictly requires:
+        1. Valid subject/anchor grounding in the context window
+        2. Substantive evidence (non-apparatus, non-passing)
+        3. Requirement-specific evidence facet match in the same context window
+        """
+        # Handle backwards-compatible positional calls where anchor was passed as 3rd arg
+        if isinstance(facet, str) and anchor is None:
+            anchor = facet
+            facet = kwargs.get("facet")
+
+        segments = cls.split_into_context_segments(text)
+        non_app_segments = [s for s, in_app in segments if not in_app and s.strip()]
+        if not non_app_segments:
+            return False, "Fetched text contains only apparatus or non-content lines."
+
+        # Build context evaluation windows (single sentences and 2-sentence windows for anaphora)
+        windows: List[str] = []
+        for i, seg in enumerate(non_app_segments):
+            windows.append(seg)
+            if i + 1 < len(non_app_segments):
+                next_seg = non_app_segments[i + 1]
+                if re.match(r'^(?:it|this|they|these|such|the\s+[a-zA-Z-]+)\b', next_seg.strip(), re.IGNORECASE):
+                    windows.append(f"{seg} {next_seg}")
+
+        all_anchor_forms: List[str] = []
+        if anchor and anchor.strip():
+            all_anchor_forms.append(anchor.strip())
+        if anchor_variants:
+            for v in anchor_variants:
+                sv = str(v).strip()
+                if sv and sv.lower() not in [x.lower() for x in all_anchor_forms]:
+                    all_anchor_forms.append(sv)
+
+        # Determine effective facet type and required relation
+        facet_type = None
+        required_relation = None
+        evidence_signals: List[str] = []
+
+        if facet and isinstance(facet, dict):
+            facet_type = str(facet.get("facet_type", "")).strip().lower()
+            required_relation = str(facet.get("required_relation", "")).strip().lower()
+            raw_sig = facet.get("evidence_signals", [])
+            if isinstance(raw_sig, list):
+                evidence_signals = [str(s).strip().lower() for s in raw_sig if str(s).strip()]
+
+        req_l = requirement.lower()
+        if not facet_type:
+            if question_type == "temporal" or any(w in req_l for w in ["when", "year", "date", "timeline", "origin", "adopted", "adoption", "coined", "founded", "history"]):
+                facet_type = "temporal"
+            elif question_type == "definition" or any(w in req_l for w in ["define", "definition", "meaning", "what is", "what are", "mechanism"]):
+                facet_type = "definition"
+            elif question_type == "comparison" or any(w in req_l for w in ["compare", "difference", "versus", "vs", "distinguish"]):
+                facet_type = "comparison"
+            elif question_type in ("causal", "explanation") or any(w in req_l for w in ["why", "purpose", "cause", "reason", "rationale"]):
+                facet_type = "causal"
+            elif any(w in req_l for w in ["how", "step", "algorithm", "procedure", "process"]):
+                facet_type = "procedure"
+            elif any(w in req_l for w in ["who", "author", "creator", "developed by", "proposed by"]):
+                facet_type = "attribution"
+            elif any(w in req_l for w in ["cost", "value", "metric", "threshold", "rate", "percentage"]):
+                facet_type = "quantitative"
+            else:
+                facet_type = "fact"
+
+        if not required_relation:
+            for rel in ["adopted", "adoption", "coined", "coining", "introduced", "introduction", "created", "creation", "founded", "invented", "named", "proposed", "defined", "measured"]:
+                if rel in req_l:
+                    required_relation = rel
+                    break
+            if not required_relation:
+                required_relation = "associated_with" if facet_type == "fact" else facet_type
+
+        # Scan context windows
+        for win in windows:
+            win_l = win.lower()
+
+            # 1. Subject / Anchor Grounding check
+            if all_anchor_forms:
+                has_anchor = any(cls.anchor_matches_text(win, af) for af in all_anchor_forms)
+                if not has_anchor:
+                    continue
+
+            # 2. Check for disqualifying passing pattern
+            if any(re.search(p, win_l) for p in cls.PASSING_MENTION_PATTERNS):
+                continue
+
+            # 3. Requirement-specific facet evaluation
+            if facet_type == "temporal":
+                # Check for temporal expressions
+                temporal_patterns = [
+                    r'\b(?:1[789]\d\d|20\d\d)\b',
+                    r'\b(?:january|february|march|april|may|june|july|august|september|october|november|december)\b',
+                    r'\b(?:1st|2nd|3rd|[0-9]+th)\s+century\b',
+                    r'\b(?:conference|workshop|symposium|summit|convention|meeting|founding|adoption\s+event|historical\s+event)\b',
+                    r'\b(?:in|during|at|around|circa|since|dated?\s+to)\s+(?:1[789]\d\d|20\d\d|[a-zA-Z\s]+(?:conference|workshop|symposium))\b'
+                ]
+                has_temporal_expr = any(re.search(p, win_l) for p in temporal_patterns)
+                if not has_temporal_expr:
+                    continue
+
+                # Check for requested temporal relation or historical event expression (FIX 4)
+                if required_relation in ("adopted", "adoption", "coined", "coining", "named"):
+                    rel_pat = r'\b(?:adopt(?:ed|ing|s|ion)?|officially\s+ado\b|coined?|first\s+(?:used|coined|adopted|named)|nam(?:ed|ing)?|historical\s+event)\b'
+                elif required_relation in ("introduced", "introduction", "origin", "originated"):
+                    rel_pat = r'\b(?:introduc(?:ed|ing|es?|tion)?|origin(?:at(?:ed|ing|es?|ion))?|first\s+(?:introduced|used|appeared)|began|started|historical\s+event)\b'
+                elif required_relation in ("created", "creation", "founded", "invented", "established"):
+                    rel_pat = r'\b(?:creat(?:ed|ing|es?|ion)?|found(?:ed|ing|s|ation)?|invent(?:ed|ing|es?|ion)?|built|established|historical\s+event)\b'
+                else:
+                    rel_pat = r'\b(?:adopt(?:ed|ing|s|ion)?|officially\s+ado\b|coined?|introduc(?:ed|ing|es?|tion)?|creat(?:ed|ing|es?|ion)?|found(?:ed|ing|s|ation)?|origin(?:at(?:ed|ing|es?|ion))?|first\s+(?:used|coined|adopted|introduced)|historical\s+event)\b'
+
+                has_rel = bool(re.search(rel_pat, win_l)) or any(sig in win_l for sig in evidence_signals if sig not in ("year", "date"))
+                if has_rel:
+                    return True, f"Temporal evidence establishing '{required_relation}' found in context window."
+
+            elif facet_type == "definition":
+                has_def_pred = any(re.search(p, win_l) for p in cls.EXPLANATORY_PREDICATE_PATTERNS)
+                if has_def_pred:
+                    words = [w.strip("?,.:;\"'()[]{}").lower() for w in win.split()]
+                    subst = [w for w in words if w not in cls.GENERIC_STOPWORDS and not any(w in af.lower() for af in all_anchor_forms)]
+                    if len(subst) >= 2:
+                        return True, "Definitional and explanatory grounding verified in context window."
+
+            elif facet_type == "comparison":
+                comp_pat = r'\b(?:differs?|difference|distinguish(?:es|ed|ing)?|in\s+contrast|unlike|whereas|compared\s+(?:with|to)|versus|vs\b)'
+                has_comp = bool(re.search(comp_pat, win_l))
+                if has_comp:
+                    return True, "Comparative evidence establishing distinction verified in context window."
+                # When evaluating distinguishing characteristics of an individual anchor entity, substantive explanatory grounding satisfies
+                has_pred = any(re.search(p, win_l) for p in cls.EXPLANATORY_PREDICATE_PATTERNS)
+                if has_pred:
+                    words = [w.strip("?,.:;\"'()[]{}").lower() for w in win.split()]
+                    subst = [w for w in words if w not in cls.GENERIC_STOPWORDS and not any(w in af.lower() for af in all_anchor_forms)]
+                    if len(subst) >= 2:
+                        return True, "Entity characteristics and behavioral properties verified in context window."
+
+            elif facet_type == "causal":
+                causal_pat = r'\b(?:because|due\s+to|causes?|results?\s+in|reason\s+is|designed\s+(?:to|for)|intended\s+to|purpose\s+is|serves\s+to|in\s+order\s+to)\b'
+                if re.search(causal_pat, win_l):
+                    return True, "Causal/purpose rationale verified in context window."
+
+            elif facet_type == "procedure":
+                proc_pat = r'\b(?:steps?|algorithm|procedure|process|first\s+[^.!?]+then|computed\s+by)\b'
+                if re.search(proc_pat, win_l):
+                    return True, "Procedural/operational evidence verified in context window."
+
+            elif facet_type == "attribution":
+                attr_pat = r'\b(?:by\s+Dr\.?\s+[A-Z][a-z]+|proposed\s+by|authored\s+by|developed\s+by|created\s+by|introduced\s+by)\b'
+                if re.search(attr_pat, win):
+                    return True, "Person/entity attribution verified in context window."
+
+            elif facet_type == "quantitative":
+                num_pat = r'\b[\$£€¥]?\d+(?:\.\d+)?\s*(?:[a-zA-Z/%]+|\b)'
+                if re.search(num_pat, win_l):
+                    return True, "Quantitative metric evidence verified in context window."
+
+            else:  # fact
+                has_pred = any(re.search(p, win_l) for p in cls.EXPLANATORY_PREDICATE_PATTERNS)
+                if has_pred:
+                    return True, "Factual property verified in explanatory context window."
+
+        return False, f"Requirement specifies {facet_type} evidence (relation: '{required_relation}'), but no grounded context window on the page contains matching evidence."
+
+
 
 @dataclass
 class EvidenceItem:
@@ -320,6 +497,7 @@ class ContradictionItem:
 class RequirementCoverage:
     """Tracks whether a question requirement has supporting evidence."""
     requirement: str
+    facet: Optional[Dict[str, Any]] = None
     satisfied: bool = False
     pages: List[int] = field(default_factory=list)
     notes: str = ""
@@ -331,21 +509,22 @@ class RequirementCoverage:
 class EvidenceLedger:
     """Deterministic ledger for logging evidence items, claims, coverage, and contradictions."""
 
-    def __init__(self, requirements: Optional[List[str]] = None):
+    def __init__(self, requirements: Optional[List[str]] = None, facets: Optional[List[Dict[str, Any]]] = None):
         self.evidence_items: List[EvidenceItem] = []
         self.claims: List[ClaimItem] = []
         self.contradictions: List[ContradictionItem] = []
         self.requirements: Dict[str, RequirementCoverage] = {}
 
         if requirements:
-            self.set_requirements(requirements)
+            self.set_requirements(requirements, facets=facets)
 
-    def set_requirements(self, requirements: List[str]):
+    def set_requirements(self, requirements: List[str], facets: Optional[List[Dict[str, Any]]] = None):
         """Initialize or update requirements to track."""
-        for req in requirements:
+        for idx, req in enumerate(requirements):
             clean_req = req.strip()
             if clean_req and clean_req not in self.requirements:
-                self.requirements[clean_req] = RequirementCoverage(requirement=clean_req)
+                f_item = facets[idx] if facets and idx < len(facets) else None
+                self.requirements[clean_req] = RequirementCoverage(requirement=clean_req, facet=f_item)
 
     def add_evidence(
         self,

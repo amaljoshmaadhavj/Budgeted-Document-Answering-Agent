@@ -58,9 +58,11 @@ class TraceLogger:
         self.doc_id: str = ""
         self.planner_output: Dict[str, Any] = {}
         self.tool_calls: List[ToolCallTrace] = []
+        self.retrieval_decisions: List[Dict[str, Any]] = []
         self.answer_status: str = "INSUFFICIENT"
         self.stop_reason: str = ""
         self.final_answer: str = ""
+        self.final_answer_consistency: str = "CONSISTENT"
 
         os.makedirs(self.trace_dir, exist_ok=True)
 
@@ -70,6 +72,47 @@ class TraceLogger:
 
     def set_planner_output(self, planner_output: Dict[str, Any]):
         self.planner_output = planner_output
+
+    def log_retrieval_decision(
+        self,
+        decision_number: int,
+        budget_remaining: int,
+        candidates_available: List[int],
+        candidate_ranking: List[Dict[str, Any]],
+        action: str,
+        target: Any,
+        rationale: str,
+        unsatisfied_requirements: Optional[List[str]] = None
+    ) -> Dict[str, Any]:
+        # Standardize decision label: SEARCH, FETCH, HEADINGS, STOP
+        action_map = {
+            "search_keyword": "SEARCH",
+            "get_page": "FETCH",
+            "list_headings": "HEADINGS",
+            "stop": "STOP"
+        }
+        decision = action_map.get(action, action.upper())
+        candidate_count = len(candidates_available)
+        top_ranked_candidate = candidate_ranking[0] if candidate_ranking else None
+
+        decision_entry = {
+            "decision_number": decision_number,
+            "remaining_budget": budget_remaining,
+            "budget_remaining": budget_remaining,
+            "candidate_count": candidate_count,
+            "candidates_available": candidates_available,
+            "top_ranked_candidate": top_ranked_candidate,
+            "candidate_ranking": candidate_ranking,
+            "decision": decision,
+            "action": action,
+            "target": target,
+            "reason": rationale,
+            "rationale": rationale,
+            "unsatisfied_requirements": unsatisfied_requirements or [],
+            "timestamp": time.strftime("%Y-%m-%d %H:%M:%S")
+        }
+        self.retrieval_decisions.append(decision_entry)
+        return decision_entry
 
     def log_tool_call(
         self,
@@ -95,10 +138,17 @@ class TraceLogger:
         self.tool_calls.append(trace_entry)
         return trace_entry
 
-    def finalize(self, answer_status: str, stop_reason: str, final_answer: str) -> Dict[str, Any]:
+    def finalize(
+        self,
+        answer_status: str,
+        stop_reason: str,
+        final_answer: str,
+        final_answer_consistency: str = "CONSISTENT"
+    ) -> Dict[str, Any]:
         self.answer_status = answer_status
         self.stop_reason = stop_reason
         self.final_answer = final_answer
+        self.final_answer_consistency = final_answer_consistency
 
         full_trace = self.to_dict()
         file_path = os.path.join(self.trace_dir, f"trace_{self.trace_id}.json")
@@ -116,10 +166,15 @@ class TraceLogger:
             "timestamp": self.start_time,
             "question": self.question,
             "doc_id": self.doc_id,
+            "question_type": self.planner_output.get("question_type", "direct_fact"),
+            "requires_document_evidence": self.planner_output.get("requires_document_evidence", True),
+            "requirement_facets": self.planner_output.get("requirement_facets", []),
             "planner_output": self.planner_output,
+            "retrieval_decisions": self.retrieval_decisions,
             "tool_calls": [call.to_dict() for call in self.tool_calls],
             "total_tool_calls": len(self.tool_calls),
             "answer_status": self.answer_status,
             "stop_reason": self.stop_reason,
             "final_answer": self.final_answer,
+            "final_answer_consistency": self.final_answer_consistency
         }

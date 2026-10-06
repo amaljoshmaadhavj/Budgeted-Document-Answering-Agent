@@ -228,9 +228,7 @@ class AnswerabilityGate:
         satisfied_reqs = ledger.satisfied_requirements_count
 
         if total_reqs == 0:
-            if len(ledger.evidence_items) > 0 and (not clean_anchors or len(covered_anchors) > 0):
-                return AnswerabilityStatus.SUPPORTED, "Relevant evidence retrieved."
-            return AnswerabilityStatus.INSUFFICIENT, "No evidence found."
+            return AnswerabilityStatus.INSUFFICIENT, "No question requirements or requirement-specific evidence established."
 
         if satisfied_reqs == total_reqs and satisfied_reqs > 0:
             if clean_anchors and not all_anchors_covered:

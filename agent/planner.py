@@ -18,6 +18,7 @@ class QuestionPlanner:
         "temporal",
         "contradiction_sensitive",
         "likely_absence",
+        "conversational",
     }
 
     QUESTION_FUNCTION_WORDS = {
@@ -31,27 +32,70 @@ class QuestionPlanner:
         "describe", "describes", "described", "description",
         "discuss", "discussion", "overview", "detail", "details",
         "information", "regarding", "about", "tell", "show", "give", "state",
-        "the", "a", "an", "difference", "compare", "between", "versus", "vs",
+        "the", "a", "an", "between", "versus", "vs",
         "provide", "provides", "provided", "answer", "question",
         "and", "or", "but", "if", "of", "to", "in", "for", "with", "on", "at",
         "by", "from", "as", "into", "through", "during", "before", "after", "above", "below",
         "term", "terms", "phrase", "phrases", "word", "words", "concept", "concepts",
-        "called", "named", "names", "known", "coined", "adopted", "introduced", "invented", "originated",
-        "year", "date", "time", "history",
-        "differ", "differs", "differed", "differing", "distinguish", "distinguishes", "distinguished", "comparison"
+        "called", "named", "names", "known", "coined",
+        "pdf", "document", "this", "that", "these", "those", "mentioned", "available", "presence",
+        "contain", "contains", "contained", "purpose", "its", "it", "you", "your", "hello", "hi", "hey",
+        "thanks", "thank", "ok", "okay", "please", "me", "my", "we", "our", "us"
     }
+
+    @classmethod
+    def is_conversational(cls, text: str) -> bool:
+        """Determines if the user input is a conversational greeting, acknowledgement, or pleasantry."""
+        t_clean = re.sub(r'[^\w\s]', '', text.lower()).strip()
+        if not t_clean:
+            return True
+        conversational_tokens = {
+            "hello", "hi", "hey", "greetings", "good", "morning", "afternoon", "evening",
+            "thank", "thanks", "you", "very", "much", "lot", "appreciated", "cheers",
+            "ok", "okay", "alright", "sure", "cool", "fine", "got", "it", "understood",
+            "bye", "goodbye", "see", "later", "please", "welcome", "yes", "no", "yep", "nope",
+            "a", "an", "the", "so", "there", "to", "for", "all"
+        }
+        words = t_clean.split()
+        if words and all(w in conversational_tokens for w in words):
+            return True
+        return False
 
     def __init__(self, llm_provider: LLMProvider):
         self.llm = llm_provider
 
     def plan(self, question: str) -> Dict[str, Any]:
         """Analyzes the question and produces structured requirements and search terms."""
+        if self.is_conversational(question):
+            return {
+                "question_type": "conversational",
+                "requires_document_evidence": False,
+                "concepts": [],
+                "search_terms": [],
+                "requirements": [],
+                "requirement_facets": [],
+                "anchor_entities": [],
+                "anchor_variants": {}
+            }
+
         user_prompt = f"Analyze the following question for document retrieval:\nQuestion: {question.strip()}"
         
         try:
             plan_data = self.llm.complete_json(PLANNER_SYSTEM_PROMPT, user_prompt)
         except Exception:
             plan_data = {}
+
+        if not plan_data.get("requires_document_evidence", True) or plan_data.get("question_type") == "conversational":
+            return {
+                "question_type": "conversational",
+                "requires_document_evidence": False,
+                "concepts": [],
+                "search_terms": [],
+                "requirements": [],
+                "requirement_facets": [],
+                "anchor_entities": [],
+                "anchor_variants": {}
+            }
 
         return self._normalize_plan(question, plan_data)
 
@@ -119,6 +163,10 @@ class QuestionPlanner:
             # E.g. "modulating dynamically" -> "dynamic modulation", "acting rationally" -> "rational action"
             for v1 in w1_vars:
                 for v0 in w0_vars:
+                    # Inversion is only grammatically meaningful if at least one word underwent morphological derivation
+                    # Never invert words without morphological transformation (e.g. "Artificial Intelligence" -> "Intelligence Artificial" is invalid)
+                    if v1.lower() == words[1].lower() and v0.lower() == words[0].lower():
+                        continue
                     inv = f"{v1} {v0}"
                     if inv.lower() != phrase.lower() and inv.lower() not in [r.lower() for r in results]:
                         results.append(inv)
@@ -205,11 +253,18 @@ class QuestionPlanner:
             if len(words) >= 2:
                 concept_initials.add("".join(w[0] for w in words).lower())
 
+        anchor_sub_words = set()
+        for a in anchor_entities:
+            for w in a.split():
+                if w.lower() not in cls.QUESTION_FUNCTION_WORDS and len(w) >= 3:
+                    anchor_sub_words.add(w.lower())
+
         tier1: List[str] = []  # Exact primary entity / multi-word phrase
         tier2: List[str] = []  # Natural terminology variants (morphological)
         tier3: List[str] = []  # Conceptual / technical variants
-        tier4: List[str] = []  # Focused component words / content keywords
+        tier4: List[str] = []  # Focused component words of anchor entities
         tier5: List[str] = []  # Broad short abbreviations / aliases
+        tier6: List[str] = []  # External relation / question vocabulary
 
         existing_all: List[str] = []
 
@@ -245,7 +300,6 @@ class QuestionPlanner:
 
             if has_multi_word:
                 is_exact_multi = any(t_lower == m.lower() for m in all_multi_words)
-                is_natural_var = t_lower in natural_lower and not is_exact_multi
 
                 # Check if this term is a broad short abbreviation / alias
                 is_abbreviation = (
@@ -258,6 +312,8 @@ class QuestionPlanner:
                     and not re.search(r'[\(\)\*]', t)
                 )
 
+                is_natural_var = t_lower in natural_lower and not is_exact_multi and not is_abbreviation
+
                 # Check if this is a technical / conceptual variant (e.g. formula f(n) or multi-word concept)
                 is_technical_or_conceptual = (
                     bool(re.search(r'[\(\)\*]', t))
@@ -266,34 +322,67 @@ class QuestionPlanner:
 
                 if is_exact_multi:
                     add_term_to_tier(t, tier1)
-                elif is_abbreviation:
-                    add_term_to_tier(t, tier5)
                 elif is_natural_var:
                     add_term_to_tier(t, tier2)
                 elif is_technical_or_conceptual:
                     add_term_to_tier(t, tier3)
-                else:
-                    # Single substantive content word (component keyword)
+                elif t_lower in anchor_sub_words:
+                    # Single substantive component word from the anchor entity
                     add_term_to_tier(t, tier4)
+                elif is_abbreviation:
+                    add_term_to_tier(t, tier5)
+                else:
+                    # Relation or question vocabulary
+                    add_term_to_tier(t, tier6)
             else:
                 # No multi-word concept: single-word entity is primary
                 is_primary_anchor = any(t_lower == a.lower() for a in anchor_entities)
+                is_abbreviation = (
+                    word_count == 1
+                    and (
+                        len(t) <= 3
+                        or (t.isupper() and len(t) <= 4)
+                    )
+                    and not re.search(r'[\(\)\*]', t)
+                )
                 if is_primary_anchor:
                     add_term_to_tier(t, tier1)
                 elif t_lower in natural_lower:
                     add_term_to_tier(t, tier2)
                 elif word_count >= 2 or re.search(r'[\(\)\*]', t):
                     add_term_to_tier(t, tier3)
+                elif is_abbreviation:
+                    add_term_to_tier(t, tier5)
                 else:
                     add_term_to_tier(t, tier4)
 
-        return tier1 + tier2 + tier3 + tier4 + tier5
+        return tier1 + tier2 + tier3 + tier4 + tier5 + tier6
 
     def _normalize_plan(self, question: str, plan_data: Dict[str, Any]) -> Dict[str, Any]:
         """Ensures all expected keys, types, and high search-quality constraints are enforced."""
+        if self.is_conversational(question):
+            return {
+                "question_type": "conversational",
+                "concepts": [],
+                "search_terms": [],
+                "requirements": [],
+                "anchor_entities": [],
+                "anchor_variants": {}
+            }
+
         q_type = plan_data.get("question_type", "direct_fact")
         if q_type not in self.VALID_QUESTION_TYPES:
             q_type = "direct_fact"
+
+        if q_type == "conversational":
+            return {
+                "question_type": "conversational",
+                "concepts": [],
+                "search_terms": [],
+                "requirements": [],
+                "anchor_entities": [],
+                "anchor_variants": {}
+            }
 
         concepts = plan_data.get("concepts", [])
         if not isinstance(concepts, list):
@@ -398,7 +487,7 @@ class QuestionPlanner:
             for mv in self._derive_morphological_variants(a):
                 raw_candidates.append(mv)
 
-        # (e) Focused component content keywords from multi-word anchors (e.g. "Intelligence", "Artificial")
+        # (e) Focused component content keywords from multi-word anchors
         for a in clean_anchors:
             if len(a.split()) >= 2:
                 comp_words = [w.strip("?,.:;\"'()") for w in a.split()]
@@ -410,6 +499,16 @@ class QuestionPlanner:
         for tok in substantive_tokens:
             if len(tok) >= 3 and tok.lower() not in self.QUESTION_FUNCTION_WORDS:
                 raw_candidates.append(tok)
+
+        # (g) Question-type and relation-specific vocabulary (FIX 7)
+        q_lower = question.lower()
+        if q_type == "temporal" or any(w in q_lower for w in ["when", "year", "date", "adopted", "coined", "origin"]):
+            for rel in ["adopted", "adoption", "origin", "coined", "introduced", "history"]:
+                if rel in q_lower:
+                    raw_candidates.append(rel)
+        elif q_type == "comparison" or any(w in q_lower for w in ["compare", "difference", "differ"]):
+            raw_candidates.append("difference")
+            raw_candidates.append("comparison")
 
         # Collect all natural variants across anchors for Tier 2 classification
         all_natural_variants: List[str] = []
@@ -432,33 +531,142 @@ class QuestionPlanner:
         if not clean_terms:
             clean_terms = [question.strip()]
 
-        # 4. Clean requirements
+        # 4. Clean requirements with generic specificity enforcement
         clean_reqs: List[str] = []
         for r in raw_requirements:
             sr = str(r).strip()
             if not sr:
                 continue
-            # Filter out requirements that are purely about question words like "Information regarding mean"
             r_words = [w.lower().strip("?,.:;\"'()") for w in sr.split()]
             sub_r_words = [w for w in r_words if w not in self.QUESTION_FUNCTION_WORDS and len(w) >= 2]
             if not sub_r_words:
                 continue
+            # If the requirement is vague ("Information regarding X" or "Details about X"), make it specific
+            if re.match(r'^(?:information\s+(?:regarding|about)|details\s+(?:regarding|about)|overview\s+of)\s+', sr, re.IGNORECASE):
+                subj = re.sub(r'^(?:information\s+(?:regarding|about)|details\s+(?:regarding|about)|overview\s+of)\s+', '', sr, flags=re.IGNORECASE).strip()
+                if "when" in q_lower or "year" in q_lower or "date" in q_lower:
+                    sr = f"Date or year of {subj}"
+                elif "define" in q_lower or "definition" in q_lower or "what is" in q_lower or "what are" in q_lower:
+                    sr = f"Definition and core mechanism of {subj}"
+                elif "why" in q_lower or "purpose" in q_lower:
+                    sr = f"Purpose and operational rationale of {subj}"
+                elif "compare" in q_lower or "difference" in q_lower or "versus" in q_lower or "vs" in q_lower:
+                    sr = f"Distinguishing characteristics and comparison of {subj}"
+                else:
+                    sr = f"Functional properties and verified facts regarding {subj}"
             clean_reqs.append(sr)
 
         if not clean_reqs:
             for a in clean_anchors:
-                if q_type == "definition":
-                    clean_reqs.append(f"Definition and explanation of {a}")
-                elif q_type == "comparison":
-                    clean_reqs.append(f"Characteristics and behavior of {a}")
+                if q_type == "definition" or "define" in q_lower or "definition" in q_lower or "what is" in q_lower or "what are" in q_lower:
+                    clean_reqs.append(f"Definition and core mechanism of {a}")
+                elif q_type == "temporal" or "when" in q_lower or "year" in q_lower or "date" in q_lower:
+                    clean_reqs.append(f"Date or year of {a}")
+                elif q_type == "comparison" or "compare" in q_lower or "difference" in q_lower or "versus" in q_lower or "vs" in q_lower:
+                    clean_reqs.append(f"Distinguishing characteristics and comparison of {a}")
+                elif "why" in q_lower or "purpose" in q_lower:
+                    clean_reqs.append(f"Purpose and operational rationale of {a}")
                 else:
-                    clean_reqs.append(f"Information regarding {a}")
+                    clean_reqs.append(f"Functional properties and verified facts regarding {a}")
+
+        # 5. Build and normalize requirement evidence facets (FIX 1 & FIX 2)
+        raw_facets = plan_data.get("requirement_facets", [])
+        facets_by_idx: Dict[int, Dict[str, Any]] = {}
+        if isinstance(raw_facets, list):
+            for rf in raw_facets:
+                if isinstance(rf, dict) and "requirement_index" in rf:
+                    try:
+                        facets_by_idx[int(rf["requirement_index"])] = rf
+                    except (ValueError, TypeError):
+                        pass
+
+        clean_facets: List[Dict[str, Any]] = []
+        for idx, req_str in enumerate(clean_reqs[:4]):
+            rf = facets_by_idx.get(idx) or (raw_facets[idx] if idx < len(raw_facets) and isinstance(raw_facets[idx], dict) else None)
+            
+            facet_type = None
+            required_relation = None
+            evidence_signals = []
+
+            if rf and isinstance(rf, dict):
+                facet_type = str(rf.get("facet_type", "")).strip().lower()
+                required_relation = str(rf.get("required_relation", "")).strip().lower()
+                raw_sig = rf.get("evidence_signals", [])
+                if isinstance(raw_sig, list):
+                    evidence_signals = [str(s).strip().lower() for s in raw_sig if str(s).strip()]
+
+            req_l = req_str.lower()
+            # If facet_type is missing or invalid, infer deterministically from requirement first
+            if not facet_type or facet_type not in {"temporal", "definition", "comparison", "causal", "procedure", "attribution", "quantitative", "fact"}:
+                if any(w in req_l for w in ["when", "year", "date", "timeline", "origin", "adopted", "adoption", "coined", "founded", "history", "time"]):
+                    facet_type = "temporal"
+                elif any(w in req_l for w in ["define", "definition", "meaning", "what is", "what are", "mechanism", "concept", "nature of"]):
+                    facet_type = "definition"
+                elif any(w in req_l for w in ["compare", "comparison", "difference", "distinguish", "versus", "vs", "distinction"]):
+                    facet_type = "comparison"
+                elif any(w in req_l for w in ["why", "purpose", "cause", "reason", "rationale", "benefit"]):
+                    facet_type = "causal"
+                elif any(w in req_l for w in ["how", "step", "algorithm", "procedure", "process", "operation"]):
+                    facet_type = "procedure"
+                elif any(w in req_l for w in ["who", "author", "creator", "developed by", "proposed by", "inventor"]):
+                    facet_type = "attribution"
+                elif any(w in req_l for w in ["cost", "value", "metric", "threshold", "rate", "number", "amount", "percentage"]):
+                    facet_type = "quantitative"
+                # Fallback to question-level only if requirement does not specify
+                elif q_type == "temporal" or any(w in q_lower for w in ["when", "year", "date", "timeline", "origin"]):
+                    facet_type = "temporal"
+                elif q_type == "definition" or any(w in q_lower for w in ["define", "definition", "meaning", "what is"]):
+                    facet_type = "definition"
+                elif q_type == "comparison" or any(w in q_lower for w in ["compare", "difference", "versus", "vs"]):
+                    facet_type = "comparison"
+                elif q_type in ("explanation", "causal") or any(w in q_lower for w in ["why", "purpose", "cause", "reason"]):
+                    facet_type = "causal"
+                else:
+                    facet_type = "fact"
+
+            # Infer required_relation from requirement first, then question fallback
+            if not required_relation:
+                for rel_cand in ["adopted", "adoption", "coined", "coining", "introduced", "introduction", "created", "creation", "founded", "invented", "named", "proposed", "defined"]:
+                    if rel_cand in req_l:
+                        required_relation = rel_cand
+                        break
+                if not required_relation:
+                    for rel_cand in ["adopted", "adoption", "coined", "coining", "introduced", "introduction", "created", "creation", "founded", "invented", "named", "proposed", "defined"]:
+                        if rel_cand in q_lower:
+                            required_relation = rel_cand
+                            break
+                if not required_relation:
+                    required_relation = "associated_with" if facet_type == "fact" else facet_type
+
+            # Infer evidence signals if missing
+            if not evidence_signals:
+                if facet_type == "temporal":
+                    evidence_signals = ["year", "date", "origin", "timeline"]
+                    if required_relation:
+                        evidence_signals.insert(0, required_relation)
+                elif facet_type == "definition":
+                    evidence_signals = ["defined as", "refers to", "meaning", "is a"]
+                elif facet_type == "comparison":
+                    evidence_signals = ["differs from", "in contrast", "difference", "compared to"]
+                elif facet_type == "causal":
+                    evidence_signals = ["because", "due to", "purpose", "causes", "results in"]
+                else:
+                    evidence_signals = [w for w in req_str.split() if w.lower() not in self.QUESTION_FUNCTION_WORDS][:4]
+
+            clean_facets.append({
+                "requirement_index": idx,
+                "facet_type": facet_type,
+                "required_relation": required_relation,
+                "evidence_signals": evidence_signals
+            })
 
         return {
             "question_type": q_type,
+            "requires_document_evidence": True,
             "concepts": [str(c).strip() for c in concepts if str(c).strip()],
             "search_terms": clean_terms[:5],
             "requirements": clean_reqs[:4],
+            "requirement_facets": clean_facets,
             "anchor_entities": clean_anchors[:3],
             "anchor_variants": clean_variants
         }

@@ -32,6 +32,8 @@ class LLMProvider:
         )
         self.openai_key: Optional[str] = os.getenv("OPENAI_API_KEY")
         self.openai_base_url: Optional[str] = os.getenv("OPENAI_BASE_URL")
+        self.openrouter_key: Optional[str] = os.getenv("OPENROUTER_API_KEY")
+        self.llm_provider_env: str = os.getenv("LLM_PROVIDER", "").lower()
 
         if mock is not None:
             self._force_mock = mock
@@ -62,8 +64,17 @@ class LLMProvider:
     def _detect_client_type(self) -> str:
         if self._force_mock:
             return "mock"
+        if self.llm_provider_env == "openrouter":
+            if self.openrouter_key and not self.openrouter_key.strip().startswith("your_"):
+                return "openrouter"
+            if self.openai_key and not self.openai_key.strip().startswith("your_"):
+                return "openrouter"
+        if self.llm_provider_env == "gemini" and self._gemini_keys:
+            return "gemini"
         if self._gemini_keys:
             return "gemini"
+        if self.openrouter_key and not self.openrouter_key.strip().startswith("your_"):
+            return "openrouter"
         if self.openai_key and not self.openai_key.strip().startswith("your_"):
             return "openai"
         return "mock"
@@ -75,7 +86,7 @@ class LLMProvider:
         """Execute a text completion request."""
         if self._client_type == "gemini":
             return self._call_gemini(system_prompt, user_prompt, temperature)
-        elif self._client_type == "openai":
+        elif self._client_type in ("openai", "openrouter"):
             return self._call_openai(system_prompt, user_prompt, temperature)
         else:
             return self._mock_completion(system_prompt, user_prompt)
@@ -89,7 +100,7 @@ class LLMProvider:
                 temperature=0.0,
                 response_mime_type="application/json"
             )
-        elif self._client_type == "openai":
+        elif self._client_type in ("openai", "openrouter"):
             raw_text = self._call_openai(system_prompt, user_prompt, temperature=0.0)
         else:
             raw_text = self._mock_completion(system_prompt, user_prompt)
@@ -227,9 +238,13 @@ class LLMProvider:
 
     def _call_openai(self, system_prompt: str, user_prompt: str, temperature: float) -> str:
         from openai import OpenAI
+        api_key = self.openrouter_key if (self._client_type == "openrouter" and self.openrouter_key) else self.openai_key
+        base_url = self.openai_base_url
+        if not base_url and self._client_type == "openrouter":
+            base_url = "https://openrouter.ai/api/v1"
         client = OpenAI(
-            api_key=self.openai_key,
-            base_url=self.openai_base_url if self.openai_base_url else None
+            api_key=api_key,
+            base_url=base_url if base_url else None
         )
         response = client.chat.completions.create(
             model=self.model_name,
@@ -253,8 +268,11 @@ class LLMProvider:
             sanitized = sanitized.replace(self.gemini_key, "[REDACTED_API_KEY]")
         if self.openai_key and len(self.openai_key) > 5:
             sanitized = sanitized.replace(self.openai_key, "[REDACTED_API_KEY]")
+        if self.openrouter_key and len(self.openrouter_key) > 5:
+            sanitized = sanitized.replace(self.openrouter_key, "[REDACTED_API_KEY]")
         sanitized = re.sub(r'\b(?:AIza|AQ\.)[A-Za-z0-9_-]+\b', '[REDACTED_API_KEY]', sanitized)
         sanitized = re.sub(r'\bsk-[A-Za-z0-9_-]{20,}\b', '[REDACTED_API_KEY]', sanitized)
+        sanitized = re.sub(r'\bsk-or-[A-Za-z0-9_-]{20,}\b', '[REDACTED_API_KEY]', sanitized)
         return sanitized
 
     def _mock_completion(self, system_prompt: str, user_prompt: str) -> str:
@@ -265,9 +283,18 @@ class LLMProvider:
             extracted = self._heuristic_plan_extraction(user_prompt)
             return json.dumps(extracted)
 
+        # Conversational mock response
+        if "conversational" in user_prompt.lower() or "conversational input" in user_prompt.lower():
+            return "Hello! I am your budgeted document assistant. How can I assist you with your document today?"
+
         # Final answer mock response
         if "INSUFFICIENT" in user_prompt:
+            u_low = user_prompt.lower()
+            if any(term in u_low for term in ["mentioned", "available", "presence", "does the document contain", "is there"]):
+                return "I could not verify the presence of the requested entity in the available document evidence."
             return "Based on the retrieved document evidence, the document does not contain sufficient information to answer the question."
+        elif "PARTIALLY_SUPPORTED" in user_prompt:
+            return "Based on the retrieved document evidence, the supported portion is verified by the cited pages; however, certain requested requirements could not be verified in the document."
         elif "CONFLICTING" in user_prompt:
             return "The retrieved document pages contain conflicting statements regarding this question that cannot be resolved safely."
         else:
@@ -290,6 +317,25 @@ class LLMProvider:
             lines = [l.strip() for l in user_prompt.split("\n") if l.strip()]
             q_clean = lines[-1] if lines else user_prompt.strip()
 
+        # Check conversational queries
+        words_lower = [w.lower().strip("?,.:;\"'()[]{}") for w in q_clean.split()]
+        conversational_tokens = {
+            "hello", "hi", "hey", "greetings", "good", "morning", "afternoon", "evening",
+            "thank", "thanks", "you", "very", "much", "lot", "appreciated", "cheers",
+            "ok", "okay", "alright", "sure", "cool", "fine", "got", "it", "understood",
+            "bye", "goodbye", "see", "later", "please", "welcome", "yes", "no", "yep", "nope",
+            "a", "an", "the", "so", "there", "to", "for", "all"
+        }
+        if words_lower and all(w in conversational_tokens for w in words_lower):
+            return {
+                "question_type": "conversational",
+                "concepts": [],
+                "search_terms": [],
+                "requirements": [],
+                "anchor_entities": [],
+                "anchor_variants": {}
+            }
+
         # Generic English linguistic stop words (grammatical function words only)
         generic_stopwords = {
             "a", "an", "the", "this", "that", "these", "those",
@@ -306,7 +352,8 @@ class LLMProvider:
             "no", "nor", "not", "only", "own", "same", "so", "than", "too", "very",
             "just", "now", "tell", "give", "show", "find", "term", "adopted",
             "explain", "define", "describe", "compare", "difference", "versus", "vs", "mean", "meaning",
-            "detail", "details", "information", "question", "document", "retrieval", "analyze", "following", "search"
+            "detail", "details", "information", "question", "document", "retrieval", "analyze", "following", "search",
+            "pdf", "mentioned", "available", "presence", "contain", "contains"
         }
 
         # Tokenize while preserving symbols attached to technical identifiers
@@ -370,11 +417,13 @@ class LLMProvider:
             if q_type == "definition":
                 requirements.append(f"{anchor} definition and core mechanisms")
             elif q_type == "comparison":
-                requirements.append(f"{anchor} characteristics and behavior")
+                requirements.append(f"{anchor} distinguishing characteristics and behavior")
             elif q_type == "temporal":
-                requirements.append(f"{anchor} origin and adoption timeline")
+                requirements.append(f"Date or year of {anchor}")
+            elif "why" in q_lower or "purpose" in q_lower:
+                requirements.append(f"Purpose and operational rationale of {anchor}")
             else:
-                requirements.append(f"{anchor} properties and facts")
+                requirements.append(f"{anchor} functional properties and verified facts")
 
         if not requirements:
             requirements = [f"{q_clean} factual details"]

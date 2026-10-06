@@ -14,9 +14,11 @@ class QuestionState:
     question: str
     doc_id: str
     question_type: str = "direct_fact"
+    requires_document_evidence: bool = True
     concepts: List[str] = field(default_factory=list)
     search_terms: List[str] = field(default_factory=list)
     evidence_requirements: List[str] = field(default_factory=list)
+    requirement_facets: List[Dict[str, Any]] = field(default_factory=list)
     anchor_entities: List[str] = field(default_factory=list)
     anchor_variants: Dict[str, List[str]] = field(default_factory=dict)
     candidate_pages: List[int] = field(default_factory=list)
@@ -28,6 +30,7 @@ class QuestionState:
     budget_used: int = 0
     budget_remaining: int = 6
     stop_reason: str = ""
+    final_answer_consistency: str = "CONSISTENT"
     trace: List[Dict[str, Any]] = field(default_factory=list)
 
     @classmethod
